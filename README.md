@@ -61,6 +61,22 @@ http://localhost:3000/redoc  # ReDoc
 - 数据库：iaas_wallet
 - 用户：iaasdev
 
+## PostHog 配置（可选）
+
+如需使用注册率功能（浏览到注册的转化率），需要配置 PostHog API：
+
+1. 设置环境变量：
+```bash
+export POSTHOG_API_KEY="your_posthog_api_key"
+export POSTHOG_PROJECT_ID="214859"  # 可选，默认值
+export POSTHOG_INSIGHT_ID="ySiO61m3"  # 可选，默认值
+export POSTHOG_BASE_URL="https://us.posthog.com"  # 可选，默认值
+```
+
+2. 或者在代码中直接修改 `app.py` 中的配置
+
+如果不配置 PostHOG_API_KEY，注册率功能将不可用，但其他功能正常。
+
 ## API 接口
 
 ### POST /api/operational-data

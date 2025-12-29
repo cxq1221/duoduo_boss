@@ -9,8 +9,16 @@ import os
 import csv
 from collections import defaultdict
 from typing import Dict, Set, List, Tuple
+import requests
+import json
 
 app = FastAPI(title="运营数据查询系统")
+
+# PostHog 配置（从环境变量读取，如果没有则使用默认值）
+POSTHOG_API_KEY = os.getenv('POSTHOG_API_KEY', 'phx_ZslpuGTtRNJ1whReQsoPdG0TM29oknVNRMKqRufszcD1Nf5')
+POSTHOG_PROJECT_ID = os.getenv('POSTHOG_PROJECT_ID', '214859')
+POSTHOG_INSIGHT_ID = os.getenv('POSTHOG_INSIGHT_ID', 'ySiO61m3')
+POSTHOG_BASE_URL = os.getenv('POSTHOG_BASE_URL', 'https://us.posthog.com')
 
 # 配置 CORS
 app.add_middleware(
@@ -138,6 +146,95 @@ class RetentionMultiRequest(BaseModel):
     startDate: str
     endDate: str
 
+def get_posthog_unique_users(start_date: str, end_date: str) -> int:
+    """从 PostHog 获取指定日期范围内的独立用户数（unique users）
+    使用 trends API 统计独立访客数，用于计算注册率
+    """
+    try:
+        if not POSTHOG_API_KEY:
+            print("警告: POSTHOG_API_KEY 未设置，无法获取浏览数据")
+            return 0
+        
+        # 使用 PostHog Trends API (GET)
+        # 参考: https://us.posthog.com/api/projects/{project_id}/insights/trend/
+        url = f"{POSTHOG_BASE_URL}/api/projects/{POSTHOG_PROJECT_ID}/insights/trend/"
+        
+        headers = {
+            "Authorization": f"Bearer {POSTHOG_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        # events 参数：使用 $pageview 事件和 unique_group 统计独立用户数
+        # 需要 JSON 编码后作为 URL 参数
+        events_json = json.dumps([{"id": "$pageview", "math": "dau"}])
+        
+        params = {
+            "date_from": start_date,
+            "date_to": end_date,
+            "interval": "month",
+            "filter_test_accounts": "true",
+            "period": "month",
+            "events": events_json
+        }
+        
+        # 构建完整的请求 URL（包含所有参数）
+        from urllib.parse import urlencode
+        full_url = f"{url}?{urlencode(params)}"
+        print("=" * 80)
+        print("PostHog API 请求信息:")
+        print(f"完整请求 URL: {full_url}")
+        print(f"请求头: {json.dumps(headers, indent=2)}")
+        print(f"请求参数: {json.dumps(params, indent=2)}")
+        print("=" * 80)
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        print("=" * 80)
+        print("PostHog API 响应信息:")
+        print(f"状态码: {response.status_code}")
+        print(f"响应头: {json.dumps(dict(response.headers), indent=2)}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            print(f"完整响应数据: {json.dumps(data, indent=2, ensure_ascii=False)}")
+            print("=" * 80)
+            
+            # 解析 PostHog 返回的数据结构
+            # 返回格式: {"result": [{"data": [1062], "count": 1062.0, ...}]}
+            unique_users = 0
+            
+            if 'result' in data and isinstance(data['result'], list) and len(data['result']) > 0:
+                # result 是一个数组，取第一个元素
+                result_item = data['result'][0]
+                
+                if isinstance(result_item, dict):
+                    # 优先使用 count 字段（浮点数）
+                    if 'count' in result_item:
+                        unique_users = result_item['count']
+                    # 如果没有 count，使用 data 数组的第一个值
+                    elif 'data' in result_item and isinstance(result_item['data'], list) and len(result_item['data']) > 0:
+                        unique_users = result_item['data'][0]
+                    # 备用：使用 value 字段
+                    elif 'value' in result_item:
+                        unique_users = result_item['value']
+            
+            if unique_users > 0:
+                print(f"成功获取独立用户数: {int(unique_users)}")
+                return int(unique_users)
+            else:
+                print("警告: 无法从 PostHog API 响应中解析独立用户数")
+                print(f"响应数据: {json.dumps(data, indent=2)}")
+                return 0
+        else:
+            print(f"错误响应内容: {response.text}")
+            print("=" * 80)
+            return 0
+    except Exception as e:
+        print(f"获取 PostHog 浏览数据失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0
+   
 # 运营数据查询接口
 @app.post("/api/operational-data")
 async def get_operational_data(request: DateRangeRequest):
@@ -266,6 +363,16 @@ async def get_operational_data(request: DateRangeRequest):
                 result['active_users'] = 0
                 result['active_rate'] = 0
             
+            # 从 PostHog 获取浏览数据并计算注册率
+            pageviews = get_posthog_unique_users(start_date, end_date)
+            result['pageviews'] = pageviews
+            
+            # 注册率 = 注册用户数 / 浏览量 × 100%
+            if pageviews > 0:
+                result['registration_rate'] = (result['total_registered_users'] / pageviews) * 100
+            else:
+                result['registration_rate'] = 0
+            
             return {
                 "success": True,
                 "data": result,
@@ -281,274 +388,6 @@ async def get_operational_data(request: DateRangeRequest):
         raise
     except Exception as e:
         print(f"查询错误: {e}")
-        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
-
-# 留存率查询接口
-@app.post("/api/retention")
-async def get_retention_data(request: RetentionRequest):
-    try:
-        retention_type = request.retentionType
-        base_date = request.baseDate
-        periods = request.periods
-        
-        if retention_type not in ['daily', 'weekly', 'monthly']:
-            raise HTTPException(status_code=400, detail="留存类型必须是 daily, weekly 或 monthly")
-        
-        if not base_date:
-            raise HTTPException(status_code=400, detail="请提供基准日期")
-        
-        if periods < 1 or periods > 100:
-            raise HTTPException(status_code=400, detail="统计周期数必须在 1-100 之间")
-        
-        # 验证日期格式
-        try:
-            base_dt = datetime.strptime(base_date, '%Y-%m-%d')
-        except ValueError:
-            raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD 格式")
-        
-        # 从连接池获取连接
-        connection = pool.get_connection()
-        try:
-            cursor = connection.cursor(dictionary=True)
-            results = []
-            
-            # 先查询基准期的活跃用户
-            if retention_type == 'daily':
-                # 日留存：基准日期当天的活跃用户
-                base_sql = """
-                    SELECT DISTINCT user_id
-                    FROM iaas_wallet.user_balance_changes
-                    WHERE type = 1
-                    AND DATE(created_at) = %s
-                """
-                cursor.execute(base_sql, (base_date,))
-                base_users = {row['user_id'] for row in cursor.fetchall()}
-                base_users_count = len(base_users)
-                
-                if base_users_count == 0:
-                    raise HTTPException(status_code=400, detail="基准日期没有活跃用户")
-                
-                # 查询每个后续日期的留存用户（使用 JOIN 优化性能）
-                for i in range(1, periods + 1):
-                    current_date = (base_dt + timedelta(days=i)).strftime('%Y-%m-%d')
-                    
-                    # 使用子查询 JOIN，性能更好
-                    retention_sql = """
-                        SELECT 
-                            COUNT(DISTINCT base.user_id) as retained_count
-                        FROM (
-                            SELECT DISTINCT user_id
-                            FROM iaas_wallet.user_balance_changes
-                            WHERE type = 1
-                            AND DATE(created_at) = %s
-                        ) base
-                        INNER JOIN (
-                            SELECT DISTINCT user_id
-                            FROM iaas_wallet.user_balance_changes
-                            WHERE type = 1
-                            AND DATE(created_at) = %s
-                        ) current ON base.user_id = current.user_id
-                    """
-                    cursor.execute(retention_sql, (base_date, current_date))
-                    retained_count = cursor.fetchone()['retained_count'] or 0
-                    
-                    # 查询当前日期总激活用户数
-                    total_sql = """
-                        SELECT COUNT(DISTINCT user_id) as total_count
-                        FROM iaas_wallet.user_balance_changes
-                        WHERE type = 1
-                        AND DATE(created_at) = %s
-                    """
-                    cursor.execute(total_sql, (current_date,))
-                    current_users_count = cursor.fetchone()['total_count'] or 0
-                    
-                    retention_rate = (retained_count / base_users_count * 100) if base_users_count > 0 else 0
-                    
-                    results.append({
-                        'period': i,
-                        'base_users': base_users_count,
-                        'current_users': current_users_count,
-                        'retained_users': retained_count,
-                        'retention_rate': retention_rate
-                    })
-                    
-            elif retention_type == 'weekly':
-                # 周留存：基准日期所在周的活跃用户（周一到周日）
-                # 计算基准周的周一
-                days_since_monday = base_dt.weekday()
-                week_start = base_dt - timedelta(days=days_since_monday)
-                week_end = week_start + timedelta(days=6)
-                
-                base_sql = """
-                    SELECT DISTINCT user_id
-                    FROM iaas_wallet.user_balance_changes
-                    WHERE type = 1
-                    AND DATE(created_at) >= %s
-                    AND DATE(created_at) <= %s
-                """
-                cursor.execute(base_sql, (week_start.strftime('%Y-%m-%d'), week_end.strftime('%Y-%m-%d')))
-                base_users = {row['user_id'] for row in cursor.fetchall()}
-                base_users_count = len(base_users)
-                
-                if base_users_count == 0:
-                    raise HTTPException(status_code=400, detail="基准周没有活跃用户")
-                
-                # 查询每个后续周的留存用户
-                for i in range(1, periods + 1):
-                    current_week_start = week_start + timedelta(weeks=i)
-                    current_week_end = current_week_start + timedelta(days=6)
-                    
-                    # 使用 JOIN 查询留存用户
-                    retention_sql = """
-                        SELECT 
-                            COUNT(DISTINCT base.user_id) as retained_count
-                        FROM (
-                            SELECT DISTINCT user_id
-                            FROM iaas_wallet.user_balance_changes
-                            WHERE type = 1
-                            AND DATE(created_at) >= %s
-                            AND DATE(created_at) <= %s
-                        ) base
-                        INNER JOIN (
-                            SELECT DISTINCT user_id
-                            FROM iaas_wallet.user_balance_changes
-                            WHERE type = 1
-                            AND DATE(created_at) >= %s
-                            AND DATE(created_at) <= %s
-                        ) current ON base.user_id = current.user_id
-                    """
-                    cursor.execute(retention_sql, (
-                        week_start.strftime('%Y-%m-%d'),
-                        week_end.strftime('%Y-%m-%d'),
-                        current_week_start.strftime('%Y-%m-%d'),
-                        current_week_end.strftime('%Y-%m-%d')
-                    ))
-                    retained_count = cursor.fetchone()['retained_count'] or 0
-                    
-                    # 查询当前周总激活用户数
-                    total_sql = """
-                        SELECT COUNT(DISTINCT user_id) as total_count
-                        FROM iaas_wallet.user_balance_changes
-                        WHERE type = 1
-                        AND DATE(created_at) >= %s
-                        AND DATE(created_at) <= %s
-                    """
-                    cursor.execute(total_sql, (
-                        current_week_start.strftime('%Y-%m-%d'),
-                        current_week_end.strftime('%Y-%m-%d')
-                    ))
-                    current_users_count = cursor.fetchone()['total_count'] or 0
-                    
-                    retention_rate = (retained_count / base_users_count * 100) if base_users_count > 0 else 0
-                    
-                    results.append({
-                        'period': i,
-                        'base_users': base_users_count,
-                        'current_users': current_users_count,
-                        'retained_users': retained_count,
-                        'retention_rate': retention_rate
-                    })
-                    
-            else:  # monthly
-                # 月留存：基准日期所在月的活跃用户
-                month_start = base_dt.replace(day=1)
-                # 计算下个月的第一天，然后减一天得到本月最后一天
-                if month_start.month == 12:
-                    month_end = month_start.replace(year=month_start.year + 1, month=1) - timedelta(days=1)
-                else:
-                    month_end = month_start.replace(month=month_start.month + 1) - timedelta(days=1)
-                
-                base_sql = """
-                    SELECT DISTINCT user_id
-                    FROM iaas_wallet.user_balance_changes
-                    WHERE type = 1
-                    AND DATE(created_at) >= %s
-                    AND DATE(created_at) <= %s
-                """
-                cursor.execute(base_sql, (month_start.strftime('%Y-%m-%d'), month_end.strftime('%Y-%m-%d')))
-                base_users = {row['user_id'] for row in cursor.fetchall()}
-                base_users_count = len(base_users)
-                
-                if base_users_count == 0:
-                    raise HTTPException(status_code=400, detail="基准月没有活跃用户")
-                
-                # 查询每个后续月的留存用户
-                for i in range(1, periods + 1):
-                    # 计算第i个月的第一天和最后一天
-                    if month_start.month + i > 12:
-                        current_month_start = month_start.replace(year=month_start.year + (month_start.month + i - 1) // 12, month=((month_start.month + i - 1) % 12) + 1)
-                    else:
-                        current_month_start = month_start.replace(month=month_start.month + i)
-                    
-                    if current_month_start.month == 12:
-                        current_month_end = current_month_start.replace(year=current_month_start.year + 1, month=1) - timedelta(days=1)
-                    else:
-                        current_month_end = current_month_start.replace(month=current_month_start.month + 1) - timedelta(days=1)
-                    
-                    # 使用 JOIN 查询留存用户
-                    retention_sql = """
-                        SELECT 
-                            COUNT(DISTINCT base.user_id) as retained_count
-                        FROM (
-                            SELECT DISTINCT user_id
-                            FROM iaas_wallet.user_balance_changes
-                            WHERE type = 1
-                            AND DATE(created_at) >= %s
-                            AND DATE(created_at) <= %s
-                        ) base
-                        INNER JOIN (
-                            SELECT DISTINCT user_id
-                            FROM iaas_wallet.user_balance_changes
-                            WHERE type = 1
-                            AND DATE(created_at) >= %s
-                            AND DATE(created_at) <= %s
-                        ) current ON base.user_id = current.user_id
-                    """
-                    cursor.execute(retention_sql, (
-                        month_start.strftime('%Y-%m-%d'),
-                        month_end.strftime('%Y-%m-%d'),
-                        current_month_start.strftime('%Y-%m-%d'),
-                        current_month_end.strftime('%Y-%m-%d')
-                    ))
-                    retained_count = cursor.fetchone()['retained_count'] or 0
-                    
-                    # 查询当前月总激活用户数
-                    total_sql = """
-                        SELECT COUNT(DISTINCT user_id) as total_count
-                        FROM iaas_wallet.user_balance_changes
-                        WHERE type = 1
-                        AND DATE(created_at) >= %s
-                        AND DATE(created_at) <= %s
-                    """
-                    cursor.execute(total_sql, (
-                        current_month_start.strftime('%Y-%m-%d'),
-                        current_month_end.strftime('%Y-%m-%d')
-                    ))
-                    current_users_count = cursor.fetchone()['total_count'] or 0
-                    
-                    retention_rate = (retained_count / base_users_count * 100) if base_users_count > 0 else 0
-                    
-                    results.append({
-                        'period': i,
-                        'base_users': base_users_count,
-                        'current_users': current_users_count,
-                        'retained_users': retained_count,
-                        'retention_rate': retention_rate
-                    })
-            
-            cursor.close()
-            
-            return {
-                "success": True,
-                "data": results
-            }
-        finally:
-            connection.close()
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"留存率查询错误: {e}")
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
 # 多时间段留存率查询接口（从 CSV 数据计算）

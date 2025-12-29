@@ -759,6 +759,16 @@
                         <div class="stat-value">${parseFloat(data.active_rate || 0).toFixed(2)}%</div>
                         <div class="stat-unit">活跃用户占比</div>
                     </div>
+                    <div class="stat-card">
+                        <div class="stat-label">浏览量</div>
+                        <div class="stat-value">${formatNumber(data.pageviews || 0)}</div>
+                        <div class="stat-unit">次</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">注册率</div>
+                        <div class="stat-value">${parseFloat(data.registration_rate || 0).toFixed(2)}%</div>
+                        <div class="stat-unit">浏览到注册转化率</div>
+                    </div>
                 </div>
             `;
             
