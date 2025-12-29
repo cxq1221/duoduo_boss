@@ -208,16 +208,63 @@ async def get_operational_data(request: DateRangeRequest):
                 AND u.created_at < DATE_ADD(%s, INTERVAL 1 DAY)
         """
         
+        # 查询激活率：从 iaas_wallet.user_balance 表统计
+        # 活跃用户定义：created_at != updated_at（发生过实例扣费）
+        active_rate_sql = """
+            SELECT
+                -- 总注册用户数（在日期范围内注册的用户）
+                COUNT(DISTINCT user_id) AS total_registered_users,
+                
+                -- 激活用户数（created_at != updated_at，表示发生过实例扣费）
+                COUNT(DISTINCT CASE 
+                    WHEN created_at != updated_at 
+                    THEN user_id 
+                    ELSE NULL 
+                END) AS active_users,
+                
+                -- 激活率 = 激活用户数 / 总注册用户数
+                CASE 
+                    WHEN COUNT(DISTINCT user_id) > 0 
+                    THEN COUNT(DISTINCT CASE 
+                        WHEN created_at != updated_at 
+                        THEN user_id 
+                        ELSE NULL 
+                    END) * 100.0 / COUNT(DISTINCT user_id)
+                    ELSE 0 
+                END AS active_rate
+            FROM iaas_wallet.user_balance
+            WHERE
+                created_at >= %s
+                AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
+        """
+        
         # 从连接池获取连接
         connection = pool.get_connection()
         try:
             cursor = connection.cursor(dictionary=True)
+            
+            # 查询运营数据
             cursor.execute(sql, (start_date, end_date, start_date, end_date))
             result = cursor.fetchone()
+            
+            # 查询激活率数据
+            cursor.execute(active_rate_sql, (start_date, end_date))
+            active_rate_result = cursor.fetchone()
+            
             cursor.close()
             
             if not result:
                 raise HTTPException(status_code=500, detail="查询结果为空")
+            
+            # 合并结果
+            if active_rate_result:
+                result['total_registered_users'] = active_rate_result.get('total_registered_users', 0)
+                result['active_users'] = active_rate_result.get('active_users', 0)
+                result['active_rate'] = active_rate_result.get('active_rate', 0)
+            else:
+                result['total_registered_users'] = 0
+                result['active_users'] = 0
+                result['active_rate'] = 0
             
             return {
                 "success": True,
@@ -305,7 +352,7 @@ async def get_retention_data(request: RetentionRequest):
                     cursor.execute(retention_sql, (base_date, current_date))
                     retained_count = cursor.fetchone()['retained_count'] or 0
                     
-                    # 查询当前日期总活跃用户数
+                    # 查询当前日期总激活用户数
                     total_sql = """
                         SELECT COUNT(DISTINCT user_id) as total_count
                         FROM iaas_wallet.user_balance_changes
@@ -378,7 +425,7 @@ async def get_retention_data(request: RetentionRequest):
                     ))
                     retained_count = cursor.fetchone()['retained_count'] or 0
                     
-                    # 查询当前周总活跃用户数
+                    # 查询当前周总激活用户数
                     total_sql = """
                         SELECT COUNT(DISTINCT user_id) as total_count
                         FROM iaas_wallet.user_balance_changes
@@ -465,7 +512,7 @@ async def get_retention_data(request: RetentionRequest):
                     ))
                     retained_count = cursor.fetchone()['retained_count'] or 0
                     
-                    # 查询当前月总活跃用户数
+                    # 查询当前月总激活用户数
                     total_sql = """
                         SELECT COUNT(DISTINCT user_id) as total_count
                         FROM iaas_wallet.user_balance_changes

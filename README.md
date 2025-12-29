@@ -40,7 +40,7 @@ python app.py
 
 或者使用 uvicorn 直接启动：
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 3000
+uvicorn app:app  --reload --host 0.0.0.0 --port 3000
 ```
 
 3. 打开浏览器访问：

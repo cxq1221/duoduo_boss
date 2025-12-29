@@ -749,6 +749,16 @@
                         <div class="stat-value">${parseFloat(data.pay_rate).toFixed(2)}%</div>
                         <div class="stat-unit">付费用户占比</div>
                     </div>
+                    <div class="stat-card">
+                        <div class="stat-label">激活用户数</div>
+                        <div class="stat-value">${formatNumber(data.active_users || 0)}</div>
+                        <div class="stat-unit">人（发生过实例扣费）</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">激活率</div>
+                        <div class="stat-value">${parseFloat(data.active_rate || 0).toFixed(2)}%</div>
+                        <div class="stat-unit">活跃用户占比</div>
+                    </div>
                 </div>
             `;
             
