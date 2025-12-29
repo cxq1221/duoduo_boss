@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>留存率调试工具</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: inline-block;
+            width: 120px;
+        }
+        input, button {
+            padding: 8px;
+            margin: 5px;
+        }
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #5568d3;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 4px;
+        }
+        .error {
+            color: red;
+            background: #fee;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .user-list {
+            max-height: 400px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        .user-item {
+            padding: 5px;
+            border-bottom: 1px solid #ddd;
+        }
+        .new-user {
+            background: #e8f5e9;
+        }
+    </style>
+</head>
+<body>
+    <h1>📊 留存率调试工具</h1>
+    
+    <div class="form-group">
+        <label>开始日期:</label>
+        <input type="date" id="startDate" value="2025-11-08">
+    </div>
+    
+    <div class="form-group">
+        <label>结束日期:</label>
+        <input type="date" id="endDate" value="2025-11-14">
+    </div>
+    
+    <div class="form-group">
+        <button onclick="debugQuery()">查询调试信息</button>
+        <button onclick="testRetention()">测试留存率查询</button>
+    </div>
+    
+    <div id="result"></div>
+
+    <script>
+        async function debugQuery() {
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            
+            const resultDiv = document.getElementById('result');
+            resultDiv.innerHTML = '<p>正在查询...</p>';
+            
+            try {
+                const response = await fetch('/api/debug-retention', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        retentionType: 'active',
+                        period: 'weekly',
+                        startDate: startDate,
+                        endDate: endDate
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    let html = `
+                        <div class="result">
+                            <h3>查询结果</h3>
+                            <p><strong>时间段:</strong> ${result.period.start} 至 ${result.period.end}</p>
+                            <p><strong>统计信息:</strong></p>
+                            <ul>
+                                <li>总活跃用户数: ${result.statistics.total_active_users}</li>
+                                <li>新增用户数: ${result.statistics.new_users}</li>
+                                <li>回流用户数: ${result.statistics.returning_users}</li>
+                            </ul>
+                            <p><strong>新增用户列表 (${result.new_users_list.length}个):</strong></p>
+                            <div class="user-list">
+                                ${result.new_users_list.map(uid => `<div class="user-item new-user">${uid}</div>`).join('')}
+                            </div>
+                            <p><strong>所有活跃用户 (${result.active_users.length}个):</strong></p>
+                            <div class="user-list">
+                                ${result.active_users.map(u => `
+                                    <div class="user-item ${u.is_new_user ? 'new-user' : ''}">
+                                        <strong>${u.user_id}</strong> - 
+                                        消费次数: ${u.consumption_count}, 
+                                        ${u.is_new_user ? '<span style="color:green">新用户</span>' : '回流用户'},
+                                        首次消费: ${u.first_consumption_ever || 'N/A'}
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                    resultDiv.innerHTML = html;
+                } else {
+                    resultDiv.innerHTML = `<div class="error">查询失败: ${result.error || result.detail}</div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="error">错误: ${error.message}</div>`;
+            }
+        }
+        
+        async function testRetention() {
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+            
+            const resultDiv = document.getElementById('result');
+            resultDiv.innerHTML = '<p>正在测试留存率查询...</p>';
+            
+            try {
+                const response = await fetch('/api/retention-multi', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        retentionType: 'new',
+                        period: 'weekly',
+                        startDate: startDate,
+                        endDate: endDate
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    let html = `
+                        <div class="result">
+                            <h3>留存率查询结果</h3>
+                            <p>时间段数量: ${result.data.length}</p>
+                            ${result.data.map(period => `
+                                <div style="margin: 10px 0; padding: 10px; background: white; border-radius: 4px;">
+                                    <strong>${period.period_label}</strong> - 新增用户: ${period.new_users}
+                                    <div style="margin-top: 5px;">
+                                        留存数据: ${period.retention_data.map((r, i) => 
+                                            `${i+1}周后: ${r.retention_rate.toFixed(2)}% (${r.retained_users}人)`
+                                        ).join(', ')}
+                                    </div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    `;
+                    resultDiv.innerHTML = html;
+                } else {
+                    resultDiv.innerHTML = `<div class="error">查询失败: ${result.error || result.detail}</div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="error">错误: ${error.message}</div>`;
+            }
+        }
+    </script>
+</body>
+</html>
+
