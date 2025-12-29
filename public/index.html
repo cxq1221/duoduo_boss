@@ -903,13 +903,23 @@
                         if (i < item.retention_data.length) {
                             const retention = item.retention_data[i];
                             if (currentDisplay === 'rate') {
-                                const rate = retention.retention_rate || 0;
-                                let rateClass = 'low';
-                                if (rate >= 50) rateClass = 'high';
-                                else if (rate >= 20) rateClass = 'medium';
-                                tableHtml += `<td><span class="retention-rate ${rateClass}">${rate.toFixed(2)}%</span></td>`;
+                                // 如果周期未到来，显示空值而不是 0.00%
+                                if (retention.retention_rate === null || retention.retention_rate === undefined) {
+                                    tableHtml += '<td>-</td>';
+                                } else {
+                                    const rate = retention.retention_rate;
+                                    let rateClass = 'low';
+                                    if (rate >= 50) rateClass = 'high';
+                                    else if (rate >= 20) rateClass = 'medium';
+                                    tableHtml += `<td><span class="retention-rate ${rateClass}">${rate.toFixed(2)}%</span></td>`;
+                                }
                             } else {
-                                tableHtml += `<td>${retention.retained_users || 0}</td>`;
+                                // 如果周期未到来，显示空值而不是 0
+                                if (retention.retained_users === null || retention.retained_users === undefined) {
+                                    tableHtml += '<td>-</td>';
+                                } else {
+                                    tableHtml += `<td>${retention.retained_users}</td>`;
+                                }
                             }
                         } else {
                             tableHtml += '<td>-</td>';

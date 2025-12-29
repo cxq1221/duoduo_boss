@@ -6,11 +6,10 @@ from datetime import datetime, timedelta
 import mysql.connector
 from mysql.connector import pooling
 import os
-import csv
-from collections import defaultdict
-from typing import Dict, Set, List, Tuple
+from typing import Set
 import requests
 import json
+from retention import calculate_retention_multi, debug_retention_data
 
 app = FastAPI(title="运营数据查询系统")
 
@@ -50,85 +49,6 @@ pool = pooling.MySQLConnectionPool(
     pool_reset_session=True,
     **db_config
 )
-
-# 数据缓存
-_data_cache = None
-_data_loaded = False
-
-def load_data_from_csv():
-    """从 CSV 文件加载数据到内存"""
-    global _data_cache, _data_loaded
-    
-    if _data_loaded:
-        return _data_cache
-    
-    print("正在加载 CSV 数据...")
-    csv_file = "user_balance_changes.csv"
-    
-    # 数据结构：
-    # user_consumptions: {user_id: [datetime, ...]} - 每个用户的消费时间列表（type=1）
-    # user_first_consumption: {user_id: datetime} - 每个用户首次消费时间
-    user_consumptions = defaultdict(list)
-    user_first_consumption = {}
-    
-    try:
-        with open(csv_file, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    user_id = row['user_id'].strip('"')
-                    type_val = int(row['type'].strip('"'))
-                    created_at_str = row['created_at'].strip('"')
-                    
-                    # 只处理消费记录（type=1）
-                    if type_val != 1:
-                        continue
-                    
-                    # 解析日期：格式可能是 "14/7/2025 16:59:45" 或 "2025-07-14 16:59:45"
-                    try:
-                        if '/' in created_at_str and len(created_at_str.split('/')[0]) <= 2:
-                            # 格式：14/7/2025 16:59:45
-                            dt = datetime.strptime(created_at_str, '%d/%m/%Y %H:%M:%S')
-                        else:
-                            # 格式：2025-07-14 16:59:45 或 2025-11-03 00:00:00
-                            if '.' in created_at_str:
-                                dt = datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S.%f')
-                            else:
-                                dt = datetime.strptime(created_at_str, '%Y-%m-%d %H:%M:%S')
-                    except ValueError:
-                        print(f"无法解析日期: {created_at_str}")
-                        continue
-                    
-                    user_consumptions[user_id].append(dt)
-                    
-                    # 记录首次消费时间
-                    if user_id not in user_first_consumption or dt < user_first_consumption[user_id]:
-                        user_first_consumption[user_id] = dt
-                        
-                except (ValueError, KeyError) as e:
-                    continue
-        
-        # 对每个用户的消费时间排序
-        for user_id in user_consumptions:
-            user_consumptions[user_id].sort()
-        
-        _data_cache = {
-            'user_consumptions': dict(user_consumptions),
-            'user_first_consumption': user_first_consumption
-        }
-        _data_loaded = True
-        
-        print(f"数据加载完成，共 {len(user_consumptions)} 个用户，{sum(len(v) for v in user_consumptions.values())} 条消费记录")
-        return _data_cache
-        
-    except FileNotFoundError:
-        print(f"CSV 文件 {csv_file} 不存在，将使用数据库查询")
-        return None
-    except Exception as e:
-        print(f"加载 CSV 数据出错: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
 
 # 请求模型
 class DateRangeRequest(BaseModel):
@@ -527,6 +447,7 @@ async def get_operational_data(request: DateRangeRequest):
 # 多时间段留存率查询接口（从 CSV 数据计算）
 @app.post("/api/retention-multi")
 async def get_retention_multi_data(request: RetentionMultiRequest):
+    """多时间段留存率查询接口"""
     try:
         retention_type = request.retentionType  # new 或 active
         period = request.period  # daily, weekly, monthly
@@ -544,156 +465,22 @@ async def get_retention_multi_data(request: RetentionMultiRequest):
         
         # 验证日期格式
         try:
-            start_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
-            end_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59, microsecond=999999)
+            datetime.strptime(start_date, '%Y-%m-%d')
+            datetime.strptime(end_date, '%Y-%m-%d')
         except ValueError:
             raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD 格式")
         
         if start_date > end_date:
             raise HTTPException(status_code=400, detail="开始日期不能晚于结束日期")
         
-        # 加载 CSV 数据
-        data_cache = load_data_from_csv()
-        if not data_cache:
-            raise HTTPException(status_code=500, detail="无法加载 CSV 数据，请确保 user_balance_changes.csv 文件存在")
-        
-        user_consumptions = data_cache['user_consumptions']
-        user_first_consumption = data_cache['user_first_consumption']
-        
-        # 生成时间段列表（修复：不强制对齐到周一，使用用户选择的精确时间范围）
-        periods = []
-        
-        if period == 'daily':
-            current = start_dt
-            while current.date() <= end_dt.date():
-                period_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
-                period_end = current.replace(hour=23, minute=59, second=59, microsecond=999999)
-                if period_start <= end_dt:
-                    periods.append((period_start, period_end))
-                current += timedelta(days=1)
-        elif period == 'weekly':
-            # 修复：使用用户选择的开始日期作为第一周的开始，而不是强制对齐到周一
-            current = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-            while current <= end_dt:
-                period_start = current
-                period_end = min(current + timedelta(days=6, hours=23, minutes=59, seconds=59, microseconds=999999), end_dt)
-                if period_start <= end_dt:
-                    periods.append((period_start, period_end))
-                current += timedelta(weeks=1)
-        else:  # monthly
-            current = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            while current <= end_dt:
-                period_start = current
-                # 计算月末
-                if current.month == 12:
-                    next_month = current.replace(year=current.year + 1, month=1, day=1)
-                else:
-                    next_month = current.replace(month=current.month + 1, day=1)
-                period_end = min(next_month - timedelta(microseconds=1), end_dt)
-                if period_start <= end_dt:
-                    periods.append((period_start, period_end))
-                current = next_month
-        
-        # 限制最多查询20个时间段
-        if len(periods) > 20:
-            periods = periods[-20:]
-        
-        results = []
-        
-        # 对每个时间段计算留存率
-        for period_start, period_end in periods:
-            # 计算该时间段的新增用户或活跃用户（使用精确时间比较）
-            base_users = set()
-            
-            if retention_type == 'new':
-                # 新用户留存：该时间段首次有消费记录的用户
-                # 修复：使用精确时间比较，检查在时间段开始之前是否有消费记录
-                for user_id, consumptions in user_consumptions.items():
-                    # 检查用户在该时间段是否有消费
-                    has_consumption_in_period = any(
-                        period_start <= dt <= period_end for dt in consumptions
-                    )
-                    
-                    if has_consumption_in_period:
-                        # 检查是否是首次消费（在时间段开始之前没有消费记录）
-                        # 修复：检查时间段开始之前是否有任何消费记录
-                        has_consumption_before = any(
-                            dt < period_start for dt in consumptions
-                        )
-                        
-                        if not has_consumption_before:
-                            # 用户在该时间段首次消费
-                            base_users.add(user_id)
-            else:
-                # 活跃用户留存：该时间段有消费记录的所有用户
-                for user_id, consumptions in user_consumptions.items():
-                    if any(period_start <= dt <= period_end for dt in consumptions):
-                        base_users.add(user_id)
-            
-            base_users_count = len(base_users)
-            
-            # 计算后续周期的留存率（最多9个周期）
-            retention_data = []
-            max_periods = 9
-            
-            for i in range(1, max_periods + 1):
-                if period == 'daily':
-                    current_period_start = (period_end + timedelta(microseconds=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                    current_period_start += timedelta(days=(i-1))
-                    current_period_end = current_period_start.replace(hour=23, minute=59, second=59, microsecond=999999)
-                elif period == 'weekly':
-                    # 修复：后续周从当前周结束后开始，不强制对齐到周一
-                    current_period_start = period_end + timedelta(microseconds=1)
-                    current_period_start += timedelta(weeks=(i-1))
-                    current_period_end = current_period_start + timedelta(days=6, hours=23, minutes=59, seconds=59, microseconds=999999)
-                else:  # monthly
-                    if period_end.month == 12:
-                        current_period_start = period_end.replace(year=period_end.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-                    else:
-                        current_period_start = period_end.replace(month=period_end.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
-                    current_period_start += timedelta(days=(i-1)*30)
-                    current_period_start = current_period_start.replace(day=1)
-                    if current_period_start.month == 12:
-                        current_period_end = current_period_start.replace(year=current_period_start.year + 1, month=1, day=1) - timedelta(microseconds=1)
-                    else:
-                        current_period_end = current_period_start.replace(month=current_period_start.month + 1, day=1) - timedelta(microseconds=1)
-                
-                # 计算在当前周期也活跃的基准用户
-                retained_users = set()
-                for user_id in base_users:
-                    consumptions = user_consumptions.get(user_id, [])
-                    if any(current_period_start <= dt <= current_period_end for dt in consumptions):
-                        retained_users.add(user_id)
-                
-                retained_count = len(retained_users)
-                retention_rate = (retained_count / base_users_count * 100) if base_users_count > 0 else 0
-                
-                retention_data.append({
-                    'retained_users': retained_count,
-                    'retention_rate': retention_rate
-                })
-            
-            # 生成时间段标签
-            if period == 'daily':
-                period_label = period_start.strftime('%Y-%m-%d')
-            elif period == 'weekly':
-                period_label = f"{period_start.strftime('%Y/%m/%d')}~{period_end.strftime('%Y/%m/%d')}"
-            else:
-                period_label = f"{period_start.strftime('%Y/%m')}"
-            
-            results.append({
-                'period_label': period_label,
-                'new_users': base_users_count,
-                'retention_data': retention_data
-            })
-        
-        return {
-            "success": True,
-            "data": results
-        }
+        # 调用留存计算模块
+        result = calculate_retention_multi(retention_type, period, start_date, end_date)
+        return result
             
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         print(f"多时间段留存率查询错误: {e}")
         import traceback
@@ -708,52 +495,18 @@ async def debug_retention(request: RetentionMultiRequest):
         start_date = request.startDate
         end_date = request.endDate
         
-        start_dt = datetime.strptime(start_date, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
-        end_dt = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59, microsecond=999999)
+        # 验证日期格式
+        try:
+            datetime.strptime(start_date, '%Y-%m-%d')
+            datetime.strptime(end_date, '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD 格式")
         
-        data_cache = load_data_from_csv()
-        if not data_cache:
-            raise HTTPException(status_code=500, detail="无法加载 CSV 数据")
-        
-        user_consumptions = data_cache['user_consumptions']
-        user_first_consumption = data_cache['user_first_consumption']
-        
-        # 查找在时间段内有消费的用户（活跃用户）
-        active_users = []
-        for user_id, consumptions in user_consumptions.items():
-            period_consumptions = [dt for dt in consumptions if start_dt <= dt <= end_dt]
-            if period_consumptions:
-                # 检查是否是新增用户（在时间段开始之前没有消费记录）
-                has_consumption_before = any(dt < start_dt for dt in consumptions)
-                first_consumption = user_first_consumption.get(user_id)
-                
-                active_users.append({
-                    'user_id': user_id,
-                    'consumption_count': len(period_consumptions),
-                    'first_consumption_in_period': min(period_consumptions).isoformat(),
-                    'last_consumption_in_period': max(period_consumptions).isoformat(),
-                    'is_new_user': not has_consumption_before,
-                    'first_consumption_ever': first_consumption.isoformat() if first_consumption else None,
-                    'total_consumptions': len(consumptions)
-                })
-        
-        # 统计新增用户
-        new_users = [u for u in active_users if u['is_new_user']]
-        
-        return {
-            "success": True,
-            "period": {
-                "start": start_dt.isoformat(),
-                "end": end_dt.isoformat()
-            },
-            "statistics": {
-                "total_active_users": len(active_users),
-                "new_users": len(new_users),
-                "returning_users": len(active_users) - len(new_users)
-            },
-            "active_users": sorted(active_users, key=lambda x: x['user_id']),
-            "new_users_list": sorted([u['user_id'] for u in new_users])
-        }
+        # 调用留存调试模块
+        result = debug_retention_data(start_date, end_date)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         import traceback
         traceback.print_exc()
