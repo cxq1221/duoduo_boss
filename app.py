@@ -146,6 +146,99 @@ class RetentionMultiRequest(BaseModel):
     startDate: str
     endDate: str
 
+def detect_fake_users(start_date: str, end_date: str) -> Set[str]:
+    """检测刷量用户（2分钟内大量创建的用户）
+    
+    算法逻辑：
+    1. 查询指定日期范围内的所有用户及其创建时间
+    2. 按创建时间排序
+    3. 滑动窗口检测：如果某个2分钟窗口内注册用户数超过阈值，标记为异常时间段
+    4. 返回所有异常时间段内的用户ID集合
+    
+    参数：
+        start_date: 开始日期
+        end_date: 结束日期
+    
+    返回：
+        刷量用户的 user_id 集合
+    """
+    try:
+        connection = pool.get_connection()
+        try:
+            cursor = connection.cursor(dictionary=True)
+            
+            # 查询指定日期范围内的所有用户及其创建时间
+            sql = """
+                SELECT user_id, created_at
+                FROM iaas_wallet.user_balance
+                WHERE created_at >= %s
+                AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
+                ORDER BY created_at ASC
+            """
+            cursor.execute(sql, (start_date, end_date))
+            users = cursor.fetchall()
+            cursor.close()
+            
+            if not users:
+                return set()
+            
+            # 将创建时间转换为 datetime 对象
+            user_times = []
+            for user in users:
+                try:
+                    if isinstance(user['created_at'], str):
+                        dt = datetime.strptime(user['created_at'], '%Y-%m-%d %H:%M:%S')
+                    else:
+                        dt = user['created_at']
+                    user_times.append((user['user_id'], dt))
+                except:
+                    continue
+            
+            if not user_times:
+                return set()
+            
+            # 滑动窗口检测刷量用户
+            fake_user_ids = set()
+            window_minutes = 1  # 2分钟窗口
+            threshold = 5  # 阈值：2分钟内超过10个用户注册认为是刷量
+            
+            # 按时间排序
+            user_times.sort(key=lambda x: x[1])
+            
+            # 滑动窗口检测（优化：使用双指针避免重复计算）
+            i = 0
+            while i < len(user_times):
+                window_start = user_times[i][1]
+                window_end = window_start + timedelta(minutes=window_minutes)
+                
+                # 统计窗口内的用户数（从当前位置开始）
+                window_users = []
+                j = i
+                while j < len(user_times) and user_times[j][1] <= window_end:
+                    window_users.append(user_times[j][0])
+                    j += 1
+                
+                # 如果窗口内用户数超过阈值，标记为刷量用户
+                if len(window_users) >= threshold:
+                    fake_user_ids.update(window_users)
+                    print(f"检测到刷量时间段: {window_start} 至 {window_end}, 用户数: {len(window_users)}")
+                    # 跳过这个窗口内的所有用户，避免重复检测
+                    i = j
+                else:
+                    # 窗口正常，继续下一个用户
+                    i += 1
+            
+            print(f"共检测到 {len(fake_user_ids)} 个刷量用户")
+            return fake_user_ids
+            
+        finally:
+            connection.close()
+    except Exception as e:
+        print(f"检测刷量用户失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return set()
+
 def get_posthog_unique_users(start_date: str, end_date: str) -> int:
     """从 PostHog 获取指定日期范围内的独立用户数（unique users）
     使用 trends API 统计独立访客数，用于计算注册率
@@ -180,23 +273,23 @@ def get_posthog_unique_users(start_date: str, end_date: str) -> int:
         # 构建完整的请求 URL（包含所有参数）
         from urllib.parse import urlencode
         full_url = f"{url}?{urlencode(params)}"
-        print("=" * 80)
-        print("PostHog API 请求信息:")
+        # print("=" * 80)
+        # # print("PostHog API 请求信息:")
         print(f"完整请求 URL: {full_url}")
-        print(f"请求头: {json.dumps(headers, indent=2)}")
-        print(f"请求参数: {json.dumps(params, indent=2)}")
-        print("=" * 80)
+        # print(f"请求头: {json.dumps(headers, indent=2)}")
+        # print(f"请求参数: {json.dumps(params, indent=2)}")
+        # print("=" * 80)
         
         response = requests.get(url, headers=headers, params=params, timeout=10)
         
         print("=" * 80)
         print("PostHog API 响应信息:")
         print(f"状态码: {response.status_code}")
-        print(f"响应头: {json.dumps(dict(response.headers), indent=2)}")
+        # print(f"响应头: {json.dumps(dict(response.headers), indent=2)}")
         
         if response.status_code == 200:
             data = response.json()
-            print(f"完整响应数据: {json.dumps(data, indent=2, ensure_ascii=False)}")
+            # print(f"完整响应数据: {json.dumps(data, indent=2, ensure_ascii=False)}")
             print("=" * 80)
             
             # 解析 PostHog 返回的数据结构
@@ -305,14 +398,38 @@ async def get_operational_data(request: DateRangeRequest):
                 AND u.created_at < DATE_ADD(%s, INTERVAL 1 DAY)
         """
         
+        # 检测刷量用户（2分钟内大量创建的用户）
+        fake_user_ids = detect_fake_users(start_date, end_date)
+        
+        # 构建排除刷量用户的 SQL 条件
+        fake_user_ids_list = list(fake_user_ids) if fake_user_ids else []
+        exclude_condition = ""
+        exclude_params = ()
+        
+        if fake_user_ids_list:
+            placeholders = ','.join(['%s'] * len(fake_user_ids_list))
+            exclude_condition = f"u.user_id NOT IN ({placeholders})"
+            exclude_params = tuple(fake_user_ids_list)
+            print(f"排除 {len(fake_user_ids_list)} 个刷量用户")
+        
+        # 修改 SQL 查询，添加排除刷量用户的条件
+        sql_with_exclude = sql
+        if exclude_condition:
+            # 在 WHERE 子句的开头添加排除条件
+            sql_with_exclude = sql.replace(
+                "WHERE\n                u.created_at >= %s",
+                f"WHERE\n                {exclude_condition}\n                AND u.created_at >= %s"
+            )
+        
         # 查询激活率：从 iaas_wallet.user_balance 表统计
         # 活跃用户定义：created_at != updated_at（发生过实例扣费）
+        # 排除刷量用户
         active_rate_sql = """
             SELECT
-                -- 总注册用户数（在日期范围内注册的用户）
+                -- 总注册用户数（在日期范围内注册的用户，排除刷量用户）
                 COUNT(DISTINCT user_id) AS total_registered_users,
                 
-                -- 激活用户数（created_at != updated_at，表示发生过实例扣费）
+                -- 激活用户数（created_at != updated_at，表示发生过实例扣费，排除刷量用户）
                 COUNT(DISTINCT CASE 
                     WHEN created_at != updated_at 
                     THEN user_id 
@@ -335,17 +452,31 @@ async def get_operational_data(request: DateRangeRequest):
                 AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
         """
         
+        # 如果有刷量用户，添加排除条件到激活率查询
+        if fake_user_ids_list:
+            placeholders = ','.join(['%s'] * len(fake_user_ids_list))
+            active_rate_sql += f" AND user_id NOT IN ({placeholders})"
+        
         # 从连接池获取连接
         connection = pool.get_connection()
         try:
             cursor = connection.cursor(dictionary=True)
             
-            # 查询运营数据
-            cursor.execute(sql, (start_date, end_date, start_date, end_date))
+            # 查询运营数据（排除刷量用户）
+            # SQL 参数顺序：start_date, end_date (recharge_order), exclude_params (user_balance WHERE), start_date, end_date (user_balance WHERE)
+            if fake_user_ids_list:
+                # 参数顺序：r.created_at 的 start_date, end_date, exclude_params (u.user_id NOT IN), u.created_at 的 start_date, end_date
+                sql_params = (start_date, end_date) + exclude_params + (start_date, end_date)
+                cursor.execute(sql_with_exclude, sql_params)
+            else:
+                cursor.execute(sql_with_exclude, (start_date, end_date, start_date, end_date))
             result = cursor.fetchone()
             
-            # 查询激活率数据
-            cursor.execute(active_rate_sql, (start_date, end_date))
+            # 查询激活率数据（排除刷量用户）
+            if fake_user_ids_list:
+                cursor.execute(active_rate_sql, (start_date, end_date) + exclude_params)
+            else:
+                cursor.execute(active_rate_sql, (start_date, end_date))
             active_rate_result = cursor.fetchone()
             
             cursor.close()
@@ -367,11 +498,14 @@ async def get_operational_data(request: DateRangeRequest):
             pageviews = get_posthog_unique_users(start_date, end_date)
             result['pageviews'] = pageviews
             
-            # 注册率 = 注册用户数 / 浏览量 × 100%
+            # 注册率 = 注册用户数 / 浏览量 × 100%（排除刷量用户后的注册用户数）
             if pageviews > 0:
                 result['registration_rate'] = (result['total_registered_users'] / pageviews) * 100
             else:
                 result['registration_rate'] = 0
+            
+            # 添加刷量用户统计信息
+            result['fake_users_count'] = len(fake_user_ids_list)
             
             return {
                 "success": True,
