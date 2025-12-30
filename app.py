@@ -10,6 +10,7 @@ from typing import Set
 import requests
 import json
 from retention import calculate_retention_multi, debug_retention_data
+from utils import detect_fake_users
 
 app = FastAPI(title="运营数据查询系统")
 
@@ -65,99 +66,6 @@ class RetentionMultiRequest(BaseModel):
     period: str  # daily, weekly, monthly
     startDate: str
     endDate: str
-
-def detect_fake_users(start_date: str, end_date: str) -> Set[str]:
-    """检测刷量用户（2分钟内大量创建的用户）
-    
-    算法逻辑：
-    1. 查询指定日期范围内的所有用户及其创建时间
-    2. 按创建时间排序
-    3. 滑动窗口检测：如果某个2分钟窗口内注册用户数超过阈值，标记为异常时间段
-    4. 返回所有异常时间段内的用户ID集合
-    
-    参数：
-        start_date: 开始日期
-        end_date: 结束日期
-    
-    返回：
-        刷量用户的 user_id 集合
-    """
-    try:
-        connection = pool.get_connection()
-        try:
-            cursor = connection.cursor(dictionary=True)
-            
-            # 查询指定日期范围内的所有用户及其创建时间
-            sql = """
-                SELECT user_id, created_at
-                FROM iaas_wallet.user_balance
-                WHERE created_at >= %s
-                AND created_at < DATE_ADD(%s, INTERVAL 1 DAY)
-                ORDER BY created_at ASC
-            """
-            cursor.execute(sql, (start_date, end_date))
-            users = cursor.fetchall()
-            cursor.close()
-            
-            if not users:
-                return set()
-            
-            # 将创建时间转换为 datetime 对象
-            user_times = []
-            for user in users:
-                try:
-                    if isinstance(user['created_at'], str):
-                        dt = datetime.strptime(user['created_at'], '%Y-%m-%d %H:%M:%S')
-                    else:
-                        dt = user['created_at']
-                    user_times.append((user['user_id'], dt))
-                except:
-                    continue
-            
-            if not user_times:
-                return set()
-            
-            # 滑动窗口检测刷量用户
-            fake_user_ids = set()
-            window_minutes = 1  # 2分钟窗口
-            threshold = 5  # 阈值：2分钟内超过10个用户注册认为是刷量
-            
-            # 按时间排序
-            user_times.sort(key=lambda x: x[1])
-            
-            # 滑动窗口检测（优化：使用双指针避免重复计算）
-            i = 0
-            while i < len(user_times):
-                window_start = user_times[i][1]
-                window_end = window_start + timedelta(minutes=window_minutes)
-                
-                # 统计窗口内的用户数（从当前位置开始）
-                window_users = []
-                j = i
-                while j < len(user_times) and user_times[j][1] <= window_end:
-                    window_users.append(user_times[j][0])
-                    j += 1
-                
-                # 如果窗口内用户数超过阈值，标记为刷量用户
-                if len(window_users) >= threshold:
-                    fake_user_ids.update(window_users)
-                    print(f"检测到刷量时间段: {window_start} 至 {window_end}, 用户数: {len(window_users)}")
-                    # 跳过这个窗口内的所有用户，避免重复检测
-                    i = j
-                else:
-                    # 窗口正常，继续下一个用户
-                    i += 1
-            
-            print(f"共检测到 {len(fake_user_ids)} 个刷量用户")
-            return fake_user_ids
-            
-        finally:
-            connection.close()
-    except Exception as e:
-        print(f"检测刷量用户失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return set()
 
 def get_posthog_unique_users(start_date: str, end_date: str) -> int:
     """从 PostHog 获取指定日期范围内的独立用户数（unique users）
@@ -318,8 +226,8 @@ async def get_operational_data(request: DateRangeRequest):
                 AND u.created_at < DATE_ADD(%s, INTERVAL 1 DAY)
         """
         
-        # 检测刷量用户（2分钟内大量创建的用户）
-        fake_user_ids = detect_fake_users(start_date, end_date)
+        # 检测刷量用户（短时间内大量创建的用户）
+        fake_user_ids = detect_fake_users(pool, start_date, end_date)
         
         # 构建排除刷量用户的 SQL 条件
         fake_user_ids_list = list(fake_user_ids) if fake_user_ids else []
